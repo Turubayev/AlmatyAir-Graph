@@ -1,0 +1,154 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>AlmatyAir-Graph — прогноз PM2.5</title>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+<style>
+  :root { --bg:#f6f7f9; --card:#fff; --ink:#1d2433; --muted:#667085; --line:#e4e7ec; --accent:#0e7490; }
+  * { box-sizing:border-box; }
+  body { margin:0; font:15px/1.45 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; background:var(--bg); color:var(--ink); }
+  header { padding:14px 20px; background:var(--card); border-bottom:1px solid var(--line); display:flex; gap:16px; flex-wrap:wrap; align-items:center; }
+  header h1 { font-size:18px; margin:0 12px 0 0; }
+  label { font-size:13px; color:var(--muted); display:flex; flex-direction:column; gap:2px; }
+  input, select, button { font:inherit; padding:6px 8px; border:1px solid var(--line); border-radius:6px; background:#fff; }
+  button { background:var(--accent); color:#fff; border:none; cursor:pointer; }
+  main { display:grid; grid-template-columns: minmax(0,1.3fr) minmax(0,1fr); gap:16px; padding:16px; }
+  @media (max-width: 900px) { main { grid-template-columns: 1fr; } }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:10px; padding:14px; }
+  #map { height:520px; border-radius:8px; }
+  table { border-collapse:collapse; width:100%; font-size:13px; }
+  th, td { padding:5px 6px; border-bottom:1px solid var(--line); text-align:right; }
+  th:first-child, td:first-child { text-align:left; }
+  .chip { display:inline-block; padding:1px 6px; border-radius:4px; color:#111; }
+  .alert { background:#fff4e5; border-left:4px solid #f79009; padding:8px 10px; margin:6px 0; border-radius:4px; font-size:13px; }
+  .muted { color:var(--muted); font-size:12px; }
+  canvas { width:100%; height:220px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>🌫️ AlmatyAir-Graph</h1>
+  <label>Момент выпуска<input id="issue" type="datetime-local" step="3600"></label>
+  <label>Заблаговременность<select id="lead"><option>12</option><option selected>24</option><option>36</option><option>48</option></select></label>
+  <label>Модель<select id="model"><option value="auto">ST-GNN</option><option value="lightgbm">LightGBM</option></select></label>
+  <label>&nbsp;<button id="go">Прогноз</button></label>
+  <label>&nbsp;<button id="live" style="background:#475467">Сейчас (live)</button></label>
+  <span class="muted" id="status"></span>
+</header>
+<main>
+  <section class="card">
+    <div id="map"></div>
+    <p class="muted">Цвет сетки — интерполяция медианного прогноза с учётом высоты рельефа. Кружки — станции. Демо-режим использует синтетический архив.</p>
+  </section>
+  <section>
+    <div class="card"><b>Предупреждения</b><div id="alerts" class="muted">—</div></div>
+    <div class="card" style="margin-top:12px"><b>Станция: <span id="stname">—</span></b><canvas id="chart" width="600" height="220"></canvas>
+      <p class="muted">Линия — медиана, заливка — интервал 10–90%, точки — наблюдения (если есть).</p></div>
+    <div class="card" style="margin-top:12px"><table id="tbl"></table></div>
+  </section>
+</main>
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script>
+const AQI = [[9,'#00e400'],[35.4,'#ffff00'],[55.4,'#ff7e00'],[125.4,'#ff0000'],[225.4,'#8f3f97'],[1e9,'#7e0023']];
+const color = v => v == null ? '#ccc' : AQI.find(([b]) => v <= b)[1];
+const map = L.map('map').setView([43.25, 76.9], 11);
+L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {attribution:'© OpenStreetMap'}).addTo(map);
+let gridLayer = L.layerGroup().addTo(map), stLayer = L.layerGroup().addTo(map);
+let stations = [], fc = [], selected = 'ALT';
+const $ = id => document.getElementById(id);
+
+async function init() {
+  stations = await (await fetch('/api/stations')).json();
+  try {
+    const r = await (await fetch('/api/demo/range')).json();
+    const d = new Date(r.test_start); d.setDate(d.getDate() + 200);
+    const p = n => String(n).padStart(2, '0');
+    $('issue').value = `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}T06:00`;
+  } catch (e) { $('status').textContent = 'модели не обучены'; }
+  run();
+}
+
+async function run(live = false) {
+  $('status').textContent = 'считаю…';
+  const model = $('model').value;
+  const url = live ? `/api/forecast/live?model=${model}` : `/api/forecast?issue_time=${$('issue').value}&model=${model}`;
+  const res = await fetch(url);
+  if (!res.ok) { $('status').textContent = 'ошибка: ' + (await res.json()).detail; return; }
+  const js = await res.json();
+  fc = js.forecast;
+  $('status').textContent = `выпуск ${js.issue_time}, источник: ${js.source}, модель: ${fc[0].model}`;
+  if (!live) await drawGrid(js.issue_time); else gridLayer.clearLayers();
+  drawStations(); drawAlerts(js.alerts); drawTable(); drawChart();
+}
+
+async function drawGrid(issue) {
+  gridLayer.clearLayers();
+  const g = await (await fetch(`/api/map?issue_time=${issue}&lead_h=${$('lead').value}&model=${$('model').value}`)).json();
+  const dlat = g.lat[1] - g.lat[0], dlon = g.lon[1] - g.lon[0];
+  g.lat.forEach((la, i) => g.lon.forEach((lo, j) => {
+    L.rectangle([[la - dlat/2, lo - dlon/2], [la + dlat/2, lo + dlon/2]],
+      {stroke:false, fillColor:color(g.pm25[i][j]), fillOpacity:0.35}).addTo(gridLayer);
+  }));
+}
+
+function drawStations() {
+  stLayer.clearLayers();
+  const lead = +$('lead').value;
+  stations.forEach(s => {
+    const r = fc.find(f => f.station_id === s.id && f.lead_h === lead);
+    const v = r ? r.q50 : null;
+    L.circleMarker([s.lat, s.lon], {radius:11, color:'#111', weight:1, fillColor:color(v), fillOpacity:0.95})
+      .bindTooltip(`${s.name}<br>${v ?? '—'} мкг/м³ (${r ? r.q10 + '–' + r.q90 : ''})<br>${r ? r.aqi : ''}`)
+      .on('click', () => { selected = s.id; drawChart(); })
+      .addTo(stLayer);
+  });
+}
+
+function drawAlerts(al) {
+  $('alerts').innerHTML = al.length ? al.map(a => {
+    const s = stations.find(x => x.id === a.station_id);
+    return `<div class="alert"><b>${s ? s.name : a.station_id}</b>: ожидается эпизод смога ${a.start.slice(5,16)} – ${a.end.slice(5,16)}, пик ≈ ${a.peak_q50} мкг/м³ (до ${a.peak_q90})</div>`;
+  }).join('') : 'Эпизодов выше 55.5 мкг/м³ на 48 ч не ожидается.';
+}
+
+function drawTable() {
+  const leads = [12, 24, 36, 48];
+  let h = '<tr><th>Станция</th>' + leads.map(l => `<th>+${l} ч</th>`).join('') + '</tr>';
+  stations.forEach(s => {
+    h += `<tr><td>${s.name}</td>` + leads.map(l => {
+      const r = fc.find(f => f.station_id === s.id && f.lead_h === l);
+      return `<td><span class="chip" style="background:${color(r?.q50)}">${r ? Math.round(r.q50) : '—'}</span></td>`;
+    }).join('') + '</tr>';
+  });
+  $('tbl').innerHTML = h;
+}
+
+function drawChart() {
+  const s = stations.find(x => x.id === selected); $('stname').textContent = s ? s.name : selected;
+  const rows = fc.filter(f => f.station_id === selected).sort((a, b) => a.lead_h - b.lead_h);
+  const c = $('chart'), ctx = c.getContext('2d'), W = c.width, H = c.height, P = 30;
+  ctx.clearRect(0, 0, W, H);
+  if (!rows.length) return;
+  const ymax = Math.max(60, ...rows.map(r => Math.max(r.q90, r.observed ?? 0))) * 1.1;
+  const x = i => P + (W - P - 10) * i / (rows.length - 1), y = v => H - P - (H - 2 * P) * v / ymax;
+  ctx.fillStyle = 'rgba(14,116,144,0.18)'; ctx.beginPath();
+  rows.forEach((r, i) => i ? ctx.lineTo(x(i), y(r.q90)) : ctx.moveTo(x(i), y(r.q90)));
+  [...rows].reverse().forEach((r, k) => ctx.lineTo(x(rows.length - 1 - k), y(r.q10))); ctx.fill();
+  ctx.strokeStyle = '#0e7490'; ctx.lineWidth = 2; ctx.beginPath();
+  rows.forEach((r, i) => i ? ctx.lineTo(x(i), y(r.q50)) : ctx.moveTo(x(i), y(r.q50))); ctx.stroke();
+  ctx.fillStyle = '#111'; rows.forEach((r, i) => { if (r.observed != null) { ctx.beginPath(); ctx.arc(x(i), y(r.observed), 2.2, 0, 7); ctx.fill(); } });
+  ctx.strokeStyle = '#f79009'; ctx.setLineDash([4, 4]); ctx.beginPath(); ctx.moveTo(P, y(55.5)); ctx.lineTo(W - 10, y(55.5)); ctx.stroke(); ctx.setLineDash([]);
+  ctx.fillStyle = '#667085'; ctx.font = '11px sans-serif';
+  [0, 12, 24, 36, 47].forEach(i => ctx.fillText('+' + (i + 1) + 'ч', x(i) - 8, H - 10));
+  [0, Math.round(ymax / 2), Math.round(ymax)].forEach(v => ctx.fillText(v, 2, y(v) + 4));
+}
+
+$('go').onclick = () => run(false);
+$('live').onclick = () => run(true);
+$('lead').onchange = () => { drawStations(); if (!$('status').textContent.includes('live')) drawGrid($('issue').value); };
+init();
+</script>
+</body>
+</html>

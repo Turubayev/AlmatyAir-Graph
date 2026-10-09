@@ -1,0 +1,31 @@
+{
+  "station_ids": [
+    "ALT",
+    "TRK",
+    "ZHT",
+    "ALM",
+    "AUE",
+    "NAU",
+    "BOS",
+    "MED",
+    "KAM"
+  ],
+  "horizons": [
+    12,
+    24,
+    36,
+    48
+  ],
+  "split": {
+    "train_end": "2023-07-01",
+    "val_end": "2024-07-01"
+  },
+  "trained": {
+    "lightgbm": true,
+    "stgnn": true
+  },
+  "train_period": [
+    "2021-07-01 00:00:00",
+    "2024-07-01"
+  ]
+}

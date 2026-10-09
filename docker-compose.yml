@@ -1,0 +1,11 @@
+services:
+  api:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      # Ключ OpenAQ для режима live (необязательно; без него используется CAMS как приближение)
+      - OPENAQ_API_KEY=${OPENAQ_API_KEY:-}
+    volumes:
+      - ./models:/app/models
+    restart: unless-stopped
