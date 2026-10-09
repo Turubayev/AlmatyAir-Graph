@@ -28,12 +28,12 @@ def load_long(path: str | Path) -> pd.DataFrame:
 
 
 def prepare(df: pd.DataFrame, stations: pd.DataFrame | None = None,
-            colocation: pd.DataFrame | str | Path | None = None) -> tuple[WideData, dict]:
+            colocation: pd.DataFrame | str | Path | None = None, calibration_end=None) -> tuple[WideData, dict]:
     st = stations if stations is not None else stations_frame()
     if isinstance(colocation, (str, Path)):
         colocation = pd.read_csv(colocation)
     if "pm25" not in df:
-        df, calib = calibrate_network(df, st, colocation)
+        df, calib = calibrate_network(df, st, colocation, calibration_end=calibration_end)
     else:
         calib = {}
     return WideData.from_long(df, st), calib
@@ -46,13 +46,16 @@ def split_indices(data: WideData, split: Split, step: int = 3, seed: int = 0):
     (0, 3, 6 … ч) модель не видела бы выпусков в остальные часы и хуже работала бы на них.
     """
     t = data.times
+    if step < 1 or pd.Timestamp(split.train_end) >= pd.Timestamp(split.val_end):
+        raise ValueError('Invalid chronological split')
     if step == 1:
         idx = np.arange(data.n_times)
     else:
         rng = np.random.default_rng(seed)
         idx = np.sort(rng.choice(data.n_times, data.n_times // step, replace=False))
-    tr = idx[t[idx] < pd.Timestamp(split.train_end)]
-    va = idx[(t[idx] >= pd.Timestamp(split.train_end)) & (t[idx] < pd.Timestamp(split.val_end))]
+    target_end = t[idx] + pd.Timedelta(hours=MAX_H)
+    tr = idx[target_end < pd.Timestamp(split.train_end)]
+    va = idx[(t[idx] >= pd.Timestamp(split.train_end)) & (target_end < pd.Timestamp(split.val_end))]
     te = idx[t[idx] >= pd.Timestamp(split.val_end)]
     return tr, va, te
 
@@ -99,7 +102,12 @@ def train(data: WideData, out_dir: str | Path, split: Split | None = None, epoch
         "horizons": list(HORIZONS),
         "split": split.__dict__,
         "trained": trained,
-        "train_period": [str(data.times[0]), split.val_end],
+        "train_period": [str(data.times[0]), split.train_end],
+        "calibration_period": [split.train_end, split.val_end],
+        "weather_mode": "issued_forecast_archive" if data.forecast_archive is not None else "reanalysis_plus_noise_research_only",
+        "split_purge_hours": MAX_H,
+        "training_revision": 2,
+        "operational_validation": False,
     }
     (out / "meta.json").write_text(json.dumps(meta, ensure_ascii=False, indent=2))
     return meta
@@ -141,7 +149,9 @@ def evaluate(data: WideData, model_dir: str | Path, split: Split | None = None, 
         preds["cams"] = {"q50": m["pm25_cams"].to_numpy()}
 
     y = tab["y"].to_numpy()
-    results: dict = {"by_horizon": {}, "episodes_24h": {}, "n_test_rows": int(np.isfinite(y).sum())}
+    results: dict = {"by_horizon": {}, "episodes_24h": {}, "n_test_rows": int(np.isfinite(y).sum()),
+                     "weather_mode": "issued_forecast_archive" if data.forecast_archive is not None else "reanalysis_plus_noise_research_only",
+                     "issued_weather_used": data.forecast_archive is not None, "operational_validation": False}
     for name, p in preds.items():
         for h in HORIZONS:
             m = (tab["horizon"] == h).to_numpy()

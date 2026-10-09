@@ -6,3 +6,5 @@ __pycache__/
 data/raw/
 data/*.csv.gz
 !data/sample/*.csv.gz
+
+runs/

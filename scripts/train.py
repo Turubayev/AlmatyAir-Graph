@@ -29,12 +29,16 @@ def main():
     ap.add_argument("--colocation", default="data/sample/colocation_demo.csv",
                     help="совместные измерения датчик/станция для калибровки ('' — калибровать по соседям)")
     ap.add_argument("--cams", help="CSV с колонками time, station_id, pm25_cams (scripts/fetch_openmeteo.py --cams)")
+    ap.add_argument('--weather-archive', help='CSV issued weather forecast archive (see almatyair/forecast_archive.py)')
     a = ap.parse_args()
 
     split = Split(a.train_end, a.val_end)
     st = pd.read_csv(a.stations).set_index("id") if a.stations else None
     coloc = a.colocation if a.colocation and Path(a.colocation).exists() else None
-    data, calib = prepare(load_long(a.data), st, coloc)
+    data, calib = prepare(load_long(a.data), st, coloc, calibration_end=split.train_end)
+    if a.weather_archive:
+        from almatyair.forecast_archive import ForecastArchive
+        data.forecast_archive = ForecastArchive(pd.read_csv(a.weather_archive))
     out = Path(a.out)
     out.mkdir(parents=True, exist_ok=True)
     (out / "calibration.json").write_text(json.dumps(calib, ensure_ascii=False, indent=2), encoding="utf-8")

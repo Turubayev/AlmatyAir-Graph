@@ -61,7 +61,7 @@ class HumidityCalibration:
 
 
 def calibrate_network(df: pd.DataFrame, stations: pd.DataFrame, colocation: pd.DataFrame | None = None,
-                      max_km: float = 5.0, max_dh: float = 100.0) -> tuple[pd.DataFrame, dict]:
+                      max_km: float = 5.0, max_dh: float = 100.0, calibration_end=None) -> tuple[pd.DataFrame, dict]:
     """Исправляет показания lowcost-датчиков; результат — колонка `pm25`.
 
     Рекомендуемый способ — `colocation`: таблица совместных измерений (pm25_raw, rh, pm25_ref),
@@ -76,9 +76,12 @@ def calibrate_network(df: pd.DataFrame, stations: pd.DataFrame, colocation: pd.D
 
     df = df.copy()
     df["pm25"] = df["pm25_raw"]
+    fit_df = df if calibration_end is None else df[pd.to_datetime(df['time']) < pd.Timestamp(calibration_end)]
     params: dict[str, dict] = {}
     lowcost = stations.index[stations["kind"] == "lowcost"]
     if colocation is not None:
+        if calibration_end is not None and 'time' in colocation:
+            colocation = colocation[pd.to_datetime(colocation['time']) < pd.Timestamp(calibration_end)]
         cal = HumidityCalibration().fit(colocation["pm25_raw"], colocation["rh"], colocation["pm25_ref"])
         m = df["station_id"].isin(lowcost)
         df.loc[m, "pm25"] = cal.correct(df.loc[m, "pm25_raw"], df.loc[m, "rh"])
@@ -86,7 +89,7 @@ def calibrate_network(df: pd.DataFrame, stations: pd.DataFrame, colocation: pd.D
             params[sid] = {**asdict(cal), "reference": "co-location", "distance_km": 0.0}
         return df, params
 
-    wide_ref = df.pivot(index="time", columns="station_id", values="pm25_ref")
+    wide_ref = fit_df.pivot(index="time", columns="station_id", values="pm25_ref")
     official = stations.index[stations["kind"] == "official"]
     for sid in lowcost:
         cands = []
@@ -98,7 +101,7 @@ def calibrate_network(df: pd.DataFrame, stations: pd.DataFrame, colocation: pd.D
         if not cands:
             continue  # датчик остаётся некалиброванным, это видно по params
         dist, ref_id = min(cands)
-        sub = df[df["station_id"] == sid].set_index("time")
+        sub = fit_df[fit_df["station_id"] == sid].set_index("time")
         cal = HumidityCalibration().fit(sub["pm25_raw"], sub["rh"], wide_ref[ref_id].reindex(sub.index))
         m = df["station_id"] == sid
         df.loc[m, "pm25"] = cal.correct(df.loc[m, "pm25_raw"], df.loc[m, "rh"])

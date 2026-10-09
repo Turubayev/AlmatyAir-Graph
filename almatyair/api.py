@@ -89,7 +89,9 @@ def forecast(issue_time: str = Query(..., description="Момент выпуск
         raise HTTPException(404, str(e)) from e
     if station_id:
         fc = fc[fc["station_id"] == station_id]
-    return {"issue_time": issue_time, "source": "demo", "forecast": _records(fc), "alerts": alerts(fc)}
+    return {"issue_time": issue_time, "source": "demo", "forecast": _records(fc), "alerts": alerts(fc),
+            "quality": {"operational_validation": False, "training_revision": service().meta.get('training_revision',1),
+                        "note": "Bundled synthetic/legacy checkpoints must be retrained and evaluated on issued forecasts before operational use."}}
 
 
 @app.get("/api/forecast/live")
@@ -101,7 +103,8 @@ def forecast_live(model: str = Query("auto", pattern="^(auto|stgnn|lightgbm)$"))
     except Exception as e:  # сеть, лимиты API
         raise HTTPException(502, f"Не удалось получить данные: {e}") from e
     fc = service().forecast(data, now, model=model)
-    return {"issue_time": str(now), "source": source, "forecast": _records(fc), "alerts": alerts(fc)}
+    return {"issue_time": str(now), "source": source, "forecast": _records(fc), "alerts": alerts(fc),
+            "quality": {"operational_validation": False, "training_revision": service().meta.get('training_revision',1)}}
 
 
 @app.get("/api/map")

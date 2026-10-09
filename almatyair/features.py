@@ -5,7 +5,7 @@
 + шум»: метео на момент t+h берётся из реанализа/наблюдений и зашумляется тем сильнее,
 чем больше заблаговременность (так модель не переоценивает надёжность метеопрогноза).
 Если доступен архив реальных прогнозов (Open-Meteo Historical Forecast API), его можно
-подать напрямую через `forecast_override`.
+подать через `WideData.forecast_archive = ForecastArchive(frame)`.
 """
 from __future__ import annotations
 
@@ -32,8 +32,13 @@ class WideData:
     stations: pd.DataFrame
     truth: np.ndarray | None = None  # (T, N), только для синтетики
     adj: np.ndarray = field(init=False)
+    forecast_archive: object | None = None
 
     def __post_init__(self):
+        self.pm = np.array(self.pm, dtype=float, copy=True)
+        self.met = {k: np.array(v, dtype=float, copy=True) for k,v in self.met.items()}
+        if self.pm.shape != (len(self.times),len(self.station_ids)) or any(v.shape != self.pm.shape for v in self.met.values()):
+            raise ValueError('Time/station arrays must share a grid')
         self.adj = static_adjacency(self.stations.loc[self.station_ids])
 
     @classmethod
@@ -47,11 +52,11 @@ class WideData:
         def wide(col):
             return df.pivot_table(index="time", columns="station_id", values=col, aggfunc="mean").reindex(index=times, columns=ids)
 
-        met = {c: wide(c).interpolate(limit=6, limit_direction="both").to_numpy() for c in ["temp", "rh", "wind_speed", "blh"]}
+        met = {c: wide(c).ffill(limit=6).to_numpy() for c in ["temp", "rh", "wind_speed", "blh"]}
         # Направление ветра интерполируем через компоненты.
         wd = np.radians(wide("wind_dir"))
-        u = np.sin(wd).interpolate(limit=6, limit_direction="both")
-        v = np.cos(wd).interpolate(limit=6, limit_direction="both")
+        u = np.sin(wd).ffill(limit=6)
+        v = np.cos(wd).ffill(limit=6)
         met["wind_dir"] = np.mod(np.degrees(np.arctan2(u, v)), 360).to_numpy()
         truth = wide("pm25_true").to_numpy() if "pm25_true" in df else None
         return cls(times, ids, wide(pm_col).to_numpy(), met, st.loc[ids], truth)
@@ -142,10 +147,12 @@ def make_tabular(
         f["pm_city"] = np.repeat(city[I][:, None], N, axis=1)
         for v in ("temp", "rh", "wind_speed", "blh"):
             f[f"{v}_now"] = data.met[v][I]
+        archive = data.forecast_archive.window(data.times[I], data.station_ids, h) if data.forecast_archive is not None else None
+        weather_rng = None if archive is not None else rng
         # Прогноз погоды на момент t+h …
         for v in ("temp", "rh", "wind_speed", "blh"):
-            f[f"{v}_fc"] = noisy_forecast(v, data.met[v][V], h, rng)
-        wd = noisy_forecast("wind_dir", data.met["wind_dir"][V], h, rng)
+            f[f"{v}_fc"] = noisy_forecast(v, archive[v][:,-1] if archive is not None else data.met[v][V], h, weather_rng)
+        wd = noisy_forecast("wind_dir", archive['wind_dir'][:,-1] if archive is not None else data.met["wind_dir"][V], h, weather_rng)
         f["wd_sin_fc"], f["wd_cos_fc"] = np.sin(np.radians(wd)), np.cos(np.radians(wd))
         # … и агрегаты прогноза по окну (t, t+h]: пришёл ли ветер, поднялась ли «крышка».
         ws_mean = _rolling(data.met["wind_speed"], h, "mean")[V]
@@ -153,11 +160,15 @@ def make_tabular(
         blh_min = _rolling(data.met["blh"], h, "min")[V]
         blh_mean = _rolling(data.met["blh"], h, "mean")[V]
         t_min = _rolling(data.met["temp"], h, "min")[V]
-        f["ws_mean_win"] = noisy_forecast("wind_speed", ws_mean, h / 2, rng)
-        f["ws_max_win"] = noisy_forecast("wind_speed", ws_max, h / 2, rng)
-        f["blh_min_win"] = noisy_forecast("blh", blh_min, h / 2, rng)
-        f["blh_mean_win"] = noisy_forecast("blh", blh_mean, h / 2, rng)
-        f["temp_min_win"] = noisy_forecast("temp", t_min, h / 2, rng)
+        if archive is not None:
+            ws_mean, ws_max = archive['wind_speed'].mean(axis=1), archive['wind_speed'].max(axis=1)
+            blh_min, blh_mean = archive['blh'].min(axis=1), archive['blh'].mean(axis=1)
+            t_min = archive['temp'].min(axis=1)
+        f["ws_mean_win"] = noisy_forecast("wind_speed", ws_mean, h / 2, weather_rng)
+        f["ws_max_win"] = noisy_forecast("wind_speed", ws_max, h / 2, weather_rng)
+        f["blh_min_win"] = noisy_forecast("blh", blh_min, h / 2, weather_rng)
+        f["blh_mean_win"] = noisy_forecast("blh", blh_mean, h / 2, weather_rng)
+        f["temp_min_win"] = noisy_forecast("temp", t_min, h / 2, weather_rng)
         for k, v in _time_feats(data.times[V]).items():
             f[f"{k}_tgt"] = np.repeat(v[:, None], N, axis=1)
         f["horizon"] = np.full((len(I), N), float(h))
@@ -173,6 +184,8 @@ def make_tabular(
             if data.truth is not None:
                 df["y_true"] = data.truth[V].reshape(-1)
         frames.append(df)
+    if not frames:
+        raise ValueError('No valid issue times: need history and full forecast horizon')
     return pd.concat(frames, ignore_index=True)
 
 
@@ -211,7 +224,7 @@ def make_sequences(data: WideData, issue_idx: np.ndarray, seed: int = 0, hist: i
     tf = _time_feats(data.times)
     wd = np.radians(data.met["wind_dir"])
     base = {
-        "pm": np.log1p(np.nan_to_num(pm, nan=np.nanmedian(pm))) / 3.0 - 1.0,
+        "pm": np.log1p(np.nan_to_num(np.clip(pm, 0, None), nan=0.0)) / 3.0 - 1.0,
         "temp": _scale_met("temp", data.met["temp"]),
         "rh": _scale_met("rh", data.met["rh"]),
         "wind_speed": _scale_met("wind_speed", data.met["wind_speed"]),
@@ -227,12 +240,15 @@ def make_sequences(data: WideData, issue_idx: np.ndarray, seed: int = 0, hist: i
     # Метеопрогноз с шумом, растущим с заблаговременностью.
     lead = np.arange(1, max_h + 1, dtype=float)[None, :, None]
     fut = {}
+    archive = data.forecast_archive.window(data.times[I], data.station_ids, max_h) if data.forecast_archive is not None and len(I) else None
+    weather_rng = None if archive is not None else rng
     for v in ("temp", "rh", "wind_speed", "blh"):
-        fut[v] = _scale_met(v, noisy_forecast(v, data.met[v][fut_ix], lead, rng))
-    wdf = np.radians(noisy_forecast("wind_dir", data.met["wind_dir"][fut_ix], lead, rng))
+        fut[v] = _scale_met(v, noisy_forecast(v, archive[v] if archive is not None else data.met[v][fut_ix], lead, weather_rng))
+    wdf = np.radians(noisy_forecast("wind_dir", archive['wind_dir'] if archive is not None else data.met["wind_dir"][fut_ix], lead, weather_rng))
     fut["wd_sin"], fut["wd_cos"] = np.sin(wdf), np.cos(wdf)
     fut["hour_sin"], fut["hour_cos"] = base["hour_sin"][fut_ix], base["hour_cos"][fut_ix]
     fut["lead"] = np.broadcast_to(lead / max_h, fut["temp"].shape)
     Xf = np.stack([fut[k] for k in FUT_FEATS], axis=-1).astype(np.float32)
     Y = data.pm[fut_ix].astype(np.float32)  # NaN = нет наблюдения, маскируется в функции потерь
-    return Xh, Xf, Y, I
+    valid = np.isfinite(Xh).all(axis=(1,2,3)) & np.isfinite(Xf).all(axis=(1,2,3))
+    return Xh[valid], Xf[valid], Y[valid], I[valid]
